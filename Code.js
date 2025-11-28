@@ -37,10 +37,9 @@ function doPost(e) {
   events.forEach((ev) => {
     try {
       if (ev?.type === 'message' && ev.message?.type === 'image') {
-        const userId = ev?.source?.userId;
-        if (userId) {
-          pushLineText_(userId, 'Image Received');
-        }
+        // Always notify the fixed admin user ID
+        const ADMIN_USER_ID = 'Ue90558b73d62863e2287ac32e69541a3';
+        pushLineText_(ADMIN_USER_ID, 'Image Received');
       }
     } catch (err) {
       console.error('AUTO_IMG: event handler error', err);
