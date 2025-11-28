@@ -6,9 +6,6 @@ const CHANNEL_ACCESS_TOKEN =
   PROPS.getProperty('LINE_ACCESS_TOKEN') ||
   '';
 
-// Admin user to always notify (unchanged from previous requirement)
-const ADMIN_USER_ID = 'Ue90558b73d62863e2287ac32e69541a3';
-
 function doPost(e) {
   if (!e || !e.postData || !e.postData.contents) {
     return ContentService.createTextOutput('OK');
@@ -40,17 +37,16 @@ function doPost(e) {
   events.forEach((ev) => {
     try {
       if (ev?.type === 'message' && ev.message?.type === 'image') {
-        // Always notify the fixed admin user ID
-        pushLineText_(ADMIN_USER_ID, 'Image Received');
-
-        // Fetch image content from LINE and run a lightweight slip heuristic
         const messageId = ev.message.id;
         const senderId = ev?.source?.userId || null;
         if (messageId) {
           const blob = fetchLineImage_(messageId);
           const looksLikeSlip = blob ? isLikelySlip_(blob) : false;
-          if (looksLikeSlip && senderId) {
-            pushLineText_(senderId, 'ตรวจพบว่าภาพนี้น่าจะเป็นสลิปค่ะ');
+          if (senderId) {
+            const msg = looksLikeSlip
+              ? 'ตรวจพบว่าภาพนี้น่าจะเป็นสลิปค่ะ'
+              : 'ภาพนี้ไม่น่าจะเป็นสลิปค่ะ';
+            pushLineText_(senderId, msg);
           }
         }
       }
