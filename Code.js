@@ -89,6 +89,18 @@ function doPost(e) {
     .setMimeType(ContentService.MimeType.JSON);
 }
 
+/** Manual trigger to prompt OAuth consent for Sheets */
+function authorizeSheets() {
+  const dummy = PROPS.getProperty('SHEET_ID') || '';
+  if (!dummy) {
+    throw new Error('Set SHEET_ID in Script properties before running authorizeSheets');
+  }
+  // A simple read to trigger authorization
+  const ss = SpreadsheetApp.openById(dummy);
+  const name = ss.getName();
+  Logger.log('Sheets access OK for: ' + name);
+}
+
 function pushLineText_(to, text) {
   if (!CHANNEL_ACCESS_TOKEN || !to) {
     console.error('AUTO_IMG: missing token or recipient');
