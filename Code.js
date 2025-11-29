@@ -5,6 +5,8 @@ const CHANNEL_ACCESS_TOKEN =
   PROPS.getProperty('LINE_CHANNEL_ACCESS_TOKEN') ||
   PROPS.getProperty('LINE_ACCESS_TOKEN') ||
   '';
+const SHEET_ID = PROPS.getProperty('SHEET_ID') || '';
+const SHEET_NAME = PROPS.getProperty('SHEET_NAME') || 'Rev_Raw';
 
 function doPost(e) {
   if (!e || !e.postData || !e.postData.contents) {
@@ -50,6 +52,14 @@ function doPost(e) {
               ocrText = text || '';
               debugInfo = debug || '';
               slipByOcr = ocrText ? isLikelySlipText_(ocrText) : false;
+              if (slipByOcr) {
+                try {
+                  appendSlipRow_(senderId, ocrText);
+                } catch (err) {
+                  debugInfo += ` | Sheet append error: ${err}`;
+                  console.error('AUTO_IMG: sheet append error', err);
+                }
+              }
             } catch (err) {
               debugInfo = `Vision error: ${err}`;
               console.error('AUTO_IMG: vision error', err);
@@ -230,4 +240,40 @@ function callVisionOcrText_(blob) {
   const out = JSON.parse(bodyText);
   const textOut = out?.responses?.[0]?.fullTextAnnotation?.text || '';
   return { text: textOut, debug: `HTTP ${code}` };
+}
+
+/** Append slip data into Google Sheet if configured */
+function appendSlipRow_(lineUserId, ocrText) {
+  if (!SHEET_ID) {
+    throw new Error('Missing SHEET_ID');
+  }
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const sh = SHEET_NAME ? ss.getSheetByName(SHEET_NAME) : ss.getSheets()[0];
+  if (!sh) throw new Error('Sheet not found');
+
+  const amount = parseAmountFromText_(ocrText);
+  const ref = parseRefFromText_(ocrText);
+  sh.appendRow([
+    new Date(),
+    lineUserId || '',
+    'slip',
+    amount !== null ? amount : '',
+    ref || '',
+    ocrText
+  ]);
+}
+
+function parseAmountFromText_(text) {
+  if (!text) return null;
+  const m = /([0-9][\d,\.]{0,15})\s*(บาท|thb|฿)/i.exec(text);
+  if (!m) return null;
+  const raw = m[1].replace(/,/g, '');
+  const num = parseFloat(raw);
+  return Number.isFinite(num) ? num : null;
+}
+
+function parseRefFromText_(text) {
+  if (!text) return null;
+  const m = /[0-9]{10,}/.exec(text.replace(/\s+/g, ''));
+  return m ? m[0] : null;
 }
