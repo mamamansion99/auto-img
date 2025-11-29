@@ -41,26 +41,31 @@ function doPost(e) {
         const senderId = ev?.source?.userId || null;
         if (messageId) {
           const blob = fetchLineImage_(messageId);
-          const looksLikeSlip = blob ? isLikelySlip_(blob) : false;
           let ocrText = '';
+          let debugInfo = '';
           let slipByOcr = null;
           if (blob) {
             try {
-              ocrText = callVisionOcrText_(blob) || '';
-              slipByOcr = isLikelySlipText_(ocrText);
+              const { text, debug } = callVisionOcrText_(blob);
+              ocrText = text || '';
+              debugInfo = debug || '';
+              slipByOcr = ocrText ? isLikelySlipText_(ocrText) : false;
             } catch (err) {
+              debugInfo = `Vision error: ${err}`;
               console.error('AUTO_IMG: vision error', err);
             }
+          } else {
+            debugInfo = 'No blob fetched';
           }
 
           if (senderId) {
-            const isSlipFinal = slipByOcr !== null ? slipByOcr : looksLikeSlip;
-            const status = isSlipFinal
+            const status = slipByOcr
               ? 'ตรวจพบว่าภาพนี้น่าจะเป็นสลิป (OCR)'
               : 'ภาพนี้ไม่น่าจะเป็นสลิป (OCR)';
             const snippetRaw = (ocrText || '').trim();
             const snippet = snippetRaw ? snippetRaw.slice(0, 500) : '[OCR empty]';
-            const msg = `${status}\n\nOCR:\n${snippet}`;
+            const dbg = debugInfo ? `\n\nDebug:\n${debugInfo.slice(0, 400)}` : '';
+            const msg = `${status}\n\nOCR:\n${snippet}${dbg}`;
             pushLineText_(senderId, msg);
           }
         }
@@ -167,7 +172,7 @@ function isLikelySlipText_(text) {
   return hits >= 2 || (hasAmount && (hits >= 1 || hasRef));
 }
 
-/** Call Google Vision OCR (Text Detection) using SA key from props */
+/** Call Google Vision OCR (Document Text Detection) using SA key from props */
 function callVisionOcrText_(blob) {
   const keyJson = PROPS.getProperty('VISION_SA_KEY');
   if (!keyJson) throw new Error('Missing VISION_SA_KEY');
@@ -205,7 +210,7 @@ function callVisionOcrText_(blob) {
     requests: [
       {
         image: { content: imageB64 },
-        features: [{ type: 'TEXT_DETECTION', maxResults: 1 }]
+        features: [{ type: 'DOCUMENT_TEXT_DETECTION', maxResults: 1 }]
       }
     ]
   };
@@ -223,5 +228,6 @@ function callVisionOcrText_(blob) {
     throw new Error('Vision API failed ' + code);
   }
   const out = JSON.parse(bodyText);
-  return out?.responses?.[0]?.fullTextAnnotation?.text || '';
+  const textOut = out?.responses?.[0]?.fullTextAnnotation?.text || '';
+  return { text: textOut, debug: `HTTP ${code}` };
 }
