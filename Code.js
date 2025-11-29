@@ -42,10 +42,24 @@ function doPost(e) {
         if (messageId) {
           const blob = fetchLineImage_(messageId);
           const looksLikeSlip = blob ? isLikelySlip_(blob) : false;
+          let ocrText = '';
+          let slipByOcr = null;
+          if (blob) {
+            try {
+              ocrText = callVisionOcrText_(blob) || '';
+              slipByOcr = isLikelySlipText_(ocrText);
+            } catch (err) {
+              console.error('AUTO_IMG: vision error', err);
+            }
+          }
+
           if (senderId) {
-            const msg = looksLikeSlip
-              ? 'ตรวจพบว่าภาพนี้น่าจะเป็นสลิปค่ะ'
-              : 'ภาพนี้ไม่น่าจะเป็นสลิปค่ะ';
+            const isSlipFinal = slipByOcr !== null ? slipByOcr : looksLikeSlip;
+            const status = isSlipFinal
+              ? 'ตรวจพบว่าภาพนี้น่าจะเป็นสลิป (OCR)'
+              : 'ภาพนี้ไม่น่าจะเป็นสลิป (OCR)';
+            const snippet = (ocrText || '').trim().slice(0, 400);
+            const msg = snippet ? `${status}\n\nOCR:\n${snippet}` : status;
             pushLineText_(senderId, msg);
           }
         }
@@ -134,4 +148,73 @@ function isLikelySlip_(blob) {
     console.error('AUTO_IMG: isLikelySlip error', err);
     return false;
   }
+}
+
+/** Decide slip from OCR text */
+function isLikelySlipText_(text) {
+  if (!text) return null;
+  const lower = String(text).toLowerCase();
+  const keywords = ['โอน', 'บาท', 'สำเร็จ', 'promptpay', 'พร้อมเพย์', 'transfer', 'successful', 'slip', 'bank', 'account'];
+  const hits = keywords.filter((k) => lower.includes(k)).length;
+  const hasAmount = /\d[\d,\.]{1,}\s*(บาท|thb|฿)/i.test(text);
+  return hits >= 2 || hasAmount;
+}
+
+/** Call Google Vision OCR (Text Detection) using SA key from props */
+function callVisionOcrText_(blob) {
+  const keyJson = PROPS.getProperty('VISION_SA_KEY');
+  if (!keyJson) throw new Error('Missing VISION_SA_KEY');
+  const sa = JSON.parse(keyJson);
+
+  const header = { alg: 'RS256', typ: 'JWT' };
+  const now = Math.floor(Date.now() / 1000);
+  const claim = {
+    iss: sa.client_email,
+    scope: 'https://www.googleapis.com/auth/cloud-vision',
+    aud: 'https://oauth2.googleapis.com/token',
+    exp: now + 3600,
+    iat: now
+  };
+  const toB64 = (obj) => Utilities.base64EncodeWebSafe(JSON.stringify(obj));
+  const unsigned = toB64(header) + '.' + toB64(claim);
+  const signature = Utilities.base64EncodeWebSafe(
+    Utilities.computeRsaSha256Signature(unsigned, sa.private_key)
+  );
+  const jwt = unsigned + '.' + signature;
+
+  const tokenRes = UrlFetchApp.fetch('https://oauth2.googleapis.com/token', {
+    method: 'post',
+    payload: {
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion: jwt
+    },
+    muteHttpExceptions: true
+  });
+  const token = JSON.parse(tokenRes.getContentText()).access_token;
+  if (!token) throw new Error('No access token from Google');
+
+  const imageB64 = Utilities.base64Encode(blob.getBytes());
+  const visionBody = {
+    requests: [
+      {
+        image: { content: imageB64 },
+        features: [{ type: 'TEXT_DETECTION', maxResults: 1 }]
+      }
+    ]
+  };
+  const res = UrlFetchApp.fetch('https://vision.googleapis.com/v1/images:annotate', {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { Authorization: 'Bearer ' + token },
+    payload: JSON.stringify(visionBody),
+    muteHttpExceptions: true
+  });
+  const bodyText = res.getContentText();
+  const code = res.getResponseCode();
+  if (code < 200 || code >= 300) {
+    console.error('AUTO_IMG: vision response', code, bodyText);
+    throw new Error('Vision API failed ' + code);
+  }
+  const out = JSON.parse(bodyText);
+  return out?.responses?.[0]?.fullTextAnnotation?.text || '';
 }
