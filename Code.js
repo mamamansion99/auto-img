@@ -58,8 +58,9 @@ function doPost(e) {
             const status = isSlipFinal
               ? 'ตรวจพบว่าภาพนี้น่าจะเป็นสลิป (OCR)'
               : 'ภาพนี้ไม่น่าจะเป็นสลิป (OCR)';
-            const snippet = (ocrText || '').trim().slice(0, 400);
-            const msg = snippet ? `${status}\n\nOCR:\n${snippet}` : status;
+            const snippetRaw = (ocrText || '').trim();
+            const snippet = snippetRaw ? snippetRaw.slice(0, 500) : '[OCR empty]';
+            const msg = `${status}\n\nOCR:\n${snippet}`;
             pushLineText_(senderId, msg);
           }
         }
@@ -154,10 +155,16 @@ function isLikelySlip_(blob) {
 function isLikelySlipText_(text) {
   if (!text) return null;
   const lower = String(text).toLowerCase();
-  const keywords = ['โอน', 'บาท', 'สำเร็จ', 'promptpay', 'พร้อมเพย์', 'transfer', 'successful', 'slip', 'bank', 'account'];
+  const keywords = [
+    'โอน', 'โอนเงิน', 'บาท', 'สำเร็จ', 'ทำรายการ',
+    'promptpay', 'พร้อมเพย์', 'kbank', 'scb', 'krungthai', 'bangkok bank',
+    'transfer', 'transferred', 'transaction', 'successful', 'success',
+    'slip', 'receipt', 'ref', 'reference', 'bank', 'account', 'payment', 'paid'
+  ];
   const hits = keywords.filter((k) => lower.includes(k)).length;
-  const hasAmount = /\d[\d,\.]{1,}\s*(บาท|thb|฿)/i.test(text);
-  return hits >= 2 || hasAmount;
+  const hasAmount = /\d[\d,\.]{1,}\s*(บาท|thb|฿)/i.test(text) || /\bthb\s*\d[\d,\.]*/i.test(text);
+  const hasRef = /ref[:\s]/i.test(text);
+  return hits >= 2 || (hasAmount && (hits >= 1 || hasRef));
 }
 
 /** Call Google Vision OCR (Text Detection) using SA key from props */
