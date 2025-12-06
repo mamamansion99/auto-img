@@ -19,6 +19,11 @@ function doPost(e) {
     const file = folder.createFile(blob);
     file.setDescription('Slip uploaded via n8n OCR');
     file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    console.log('auto-img: saved file', {
+      name: file.getName(),
+      size: file.getSize(),
+      mime: file.getMimeType()
+    });
 
     const vision = callVisionOcrText_(file);
     const rawText = (vision && vision.text) || '';
@@ -44,12 +49,45 @@ function doPost(e) {
 }
 
 function buildBlobFromRequest_(e) {
-  const contents = e?.postData?.contents;
+  const postData = e?.postData;
+  if (!postData) {
+    throw new Error('Missing postData');
+  }
+
+  const filename = sanitizeFilename(String(e?.parameter?.filename || 'slip.jpg'));
+  const contentType = postData.type || 'image/jpeg';
+  const bytes = postData.bytes;
+  const contents = postData.contents || '';
+
+  if (bytes && bytes.length) {
+    console.log('auto-img: using postData.bytes', {
+      filename,
+      contentType,
+      byteLength: bytes.length
+    });
+    return Utilities.newBlob(bytes, contentType, filename);
+  }
+
   if (!contents) {
     throw new Error('Empty request body');
   }
-  const contentType = e?.postData?.type || 'image/jpeg';
-  const filename = sanitizeFilename(String(e?.parameter?.filename || 'slip.jpg'));
+
+  const rawLength = contents.length;
+  if (looksLikeBase64_(contents)) {
+    try {
+      const decoded = Utilities.base64Decode(contents.replace(/[\r\n]/g, ''));
+      console.log('auto-img: decoded base64 payload', {
+        filename,
+        contentType,
+        rawLength,
+        decodedLength: decoded.length
+      });
+      return Utilities.newBlob(decoded, contentType, filename);
+    } catch (err) {
+      console.warn('auto-img: base64 decode failed, falling back to raw blob', err);
+    }
+  }
+
   return Utilities.newBlob(contents, contentType, filename);
 }
 
@@ -78,6 +116,15 @@ function getMetadata_(e) {
     }
   });
   return meta;
+}
+
+function looksLikeBase64_(value) {
+  if (!value) return false;
+  // If there are control characters, assume raw binary already.
+  if (/[\x00-\x08\x0E-\x1F]/.test(value)) return false;
+  const normalized = value.replace(/[\r\n\s]/g, '');
+  if (!normalized || normalized.length % 4 !== 0) return false;
+  return /^[A-Za-z0-9+/]+={0,2}$/.test(normalized);
 }
 
 function jsonResponse_(payload, opts = {}) {
