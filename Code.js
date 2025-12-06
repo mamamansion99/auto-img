@@ -10,20 +10,7 @@ function doPost(e) {
       throw new Error('Missing or invalid secret');
     }
 
-    if (!SLIP_FOLDER_ID) {
-      throw new Error('Missing SLIP_FOLDER_ID');
-    }
-
-    const blob = buildBlobFromRequest_(e);
-    const folder = DriveApp.getFolderById(SLIP_FOLDER_ID);
-    const file = folder.createFile(blob);
-    file.setDescription('Slip uploaded via n8n OCR');
-    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
-    console.log('auto-img: saved file', {
-      name: file.getName(),
-      size: file.getSize(),
-      mime: file.getMimeType()
-    });
+    const { file } = resolveSlipFile_(e);
 
     const vision = callVisionOcrText_(file);
     const rawText = (vision && vision.text) || '';
@@ -49,46 +36,116 @@ function doPost(e) {
 }
 
 function buildBlobFromRequest_(e) {
-  const postData = e?.postData;
-  if (!postData) {
-    throw new Error('Missing postData');
+  const pd = e && e.postData;
+  if (!pd) {
+    throw new Error('No postData on request');
   }
 
+  const type = pd.type || 'image/jpeg';
   const filename = sanitizeFilename(String(e?.parameter?.filename || 'slip.jpg'));
-  const contentType = postData.type || 'image/jpeg';
-  const bytes = postData.bytes;
-  const contents = postData.contents || '';
 
-  if (bytes && bytes.length) {
-    console.log('auto-img: using postData.bytes', {
-      filename,
-      contentType,
-      byteLength: bytes.length
-    });
-    return Utilities.newBlob(bytes, contentType, filename);
+  const bytes = pd.bytes;
+  const contents = pd.contents;
+  const bytesLen = bytes ? bytes.length : 0;
+  const contentsLen = contents ? contents.length : 0;
+
+  // Prefer bytes if available
+  if (bytes && bytesLen > 0) {
+    console.log('auto-img: using postData.bytes', { filename, type, bytesLen });
+    return Utilities.newBlob(bytes, type, filename);
   }
 
-  if (!contents) {
-    throw new Error('Empty request body');
-  }
-
-  const rawLength = contents.length;
-  if (looksLikeBase64_(contents)) {
-    try {
-      const decoded = Utilities.base64Decode(contents.replace(/[\r\n]/g, ''));
-      console.log('auto-img: decoded base64 payload', {
-        filename,
-        contentType,
-        rawLength,
-        decodedLength: decoded.length
-      });
-      return Utilities.newBlob(decoded, contentType, filename);
-    } catch (err) {
-      console.warn('auto-img: base64 decode failed, falling back to raw blob', err);
+  // Fallback to contents (base64 or raw string)
+  if (contents && contentsLen > 0) {
+    if (looksLikeBase64_(contents)) {
+      try {
+        const decoded = Utilities.base64Decode(contents.replace(/[\r\n]/g, ''));
+        console.log('auto-img: decoded base64 fallback', {
+          filename,
+          type,
+          contentsLen,
+          decodedLen: decoded.length
+        });
+        return Utilities.newBlob(decoded, type, filename);
+      } catch (err) {
+        console.warn('auto-img: base64 decode failed, using raw contents', err);
+      }
+    } else {
+      console.log('auto-img: contents appears raw, using directly', { filename, type, contentsLen });
     }
+    return Utilities.newBlob(contents, type, filename);
   }
 
-  return Utilities.newBlob(contents, contentType, filename);
+  // Truly empty
+  throw new Error(
+    'Empty request body: bytesLen=' +
+      bytesLen +
+      ', contentsLen=' +
+      contentsLen +
+      ', type=' +
+      type
+  );
+}
+
+function resolveSlipFile_(e) {
+  const fileId = String(e?.parameter?.fileId || '').trim();
+  const hasFileId = !!fileId;
+  let targetFolder = null;
+
+  if (SLIP_FOLDER_ID) {
+    targetFolder = DriveApp.getFolderById(SLIP_FOLDER_ID);
+  } else if (!hasFileId) {
+    throw new Error('Missing SLIP_FOLDER_ID');
+  }
+
+  if (hasFileId) {
+    const existing = DriveApp.getFileById(fileId);
+    if (!existing) {
+      throw new Error('File not found for fileId=' + fileId);
+    }
+
+    if (targetFolder) {
+      let inFolder = false;
+      const parents = existing.getParents();
+      while (parents.hasNext()) {
+        const parent = parents.next();
+        if (parent.getId() === SLIP_FOLDER_ID) {
+          inFolder = true;
+          break;
+        }
+      }
+      if (!inFolder) {
+        targetFolder.addFile(existing);
+        console.log('auto-img: added existing file to target folder', { fileId, folderId: SLIP_FOLDER_ID });
+      }
+    }
+
+    try {
+      existing.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    } catch (err) {
+      console.warn('auto-img: failed to set sharing on existing file', err);
+    }
+
+    console.log('auto-img: using existing Drive file', {
+      fileId,
+      name: existing.getName(),
+      size: existing.getSize(),
+      mime: existing.getMimeType()
+    });
+    return { file: existing, created: false };
+  }
+
+  const blob = buildBlobFromRequest_(e);
+  const folder = targetFolder || DriveApp.getRootFolder();
+  const createdFile = folder.createFile(blob);
+  createdFile.setDescription('Slip uploaded via n8n OCR');
+  createdFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+  console.log('auto-img: saved file', {
+    name: createdFile.getName(),
+    size: createdFile.getSize(),
+    mime: createdFile.getMimeType()
+  });
+  return { file: createdFile, created: true };
 }
 
 function sanitizeFilename(name) {
@@ -193,7 +250,20 @@ function callVisionOcrText_(file) {
     throw new Error(`Vision API error ${code}: ${text}`);
   }
   const body = JSON.parse(text);
-  const extracted = body?.responses?.[0]?.fullTextAnnotation?.text || '';
+  const response = body?.responses?.[0] || {};
+  let extracted = (response?.fullTextAnnotation?.text || '').trim();
+  if (!extracted && Array.isArray(response?.textAnnotations) && response.textAnnotations.length > 0) {
+    extracted = (response.textAnnotations[0].description || '').trim();
+  }
+
+  if (!extracted) {
+    console.warn('Vision returned empty text', {
+      annotations: (response?.textAnnotations || []).length,
+      hasFullText: !!response?.fullTextAnnotation?.text,
+      error: response?.error
+    });
+  }
+
   return { text: extracted, debug: `Vision HTTP ${code}` };
 }
 
