@@ -1,195 +1,98 @@
 const PROPS = PropertiesService.getScriptProperties();
 const WORKER_SECRET = PROPS.getProperty('WORKER_SECRET') || '';
-const CHANNEL_ACCESS_TOKEN =
-  PROPS.getProperty('CHANNEL_ACCESS_TOKEN') ||
-  PROPS.getProperty('LINE_CHANNEL_ACCESS_TOKEN') ||
-  PROPS.getProperty('LINE_ACCESS_TOKEN') ||
-  '';
-const SHEET_ID = PROPS.getProperty('SHEET_ID') || '';
-const SHEET_NAME = PROPS.getProperty('SHEET_NAME') || 'Rev_Raw';
+const SLIP_FOLDER_ID = PROPS.getProperty('SLIP_FOLDER_ID') || '';
+const VISION_SA_KEY = PROPS.getProperty('VISION_SA_KEY') || '';
 
 function doPost(e) {
-  if (!e || !e.postData || !e.postData.contents) {
-    return ContentService.createTextOutput('OK');
-  }
-
-  let body = {};
   try {
-    body = JSON.parse(e.postData.contents || '{}');
+    const providedSecret = getProvidedSecret_(e);
+    if (WORKER_SECRET && providedSecret !== WORKER_SECRET) {
+      throw new Error('Missing or invalid secret');
+    }
+
+    if (!SLIP_FOLDER_ID) {
+      throw new Error('Missing SLIP_FOLDER_ID');
+    }
+
+    const blob = buildBlobFromRequest_(e);
+    const folder = DriveApp.getFolderById(SLIP_FOLDER_ID);
+    const file = folder.createFile(blob);
+    file.setDescription('Slip uploaded via n8n OCR');
+    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+
+    const vision = callVisionOcrText_(file);
+    const rawText = (vision && vision.text) || '';
+    const parsed = parseKPlusSlip_(rawText);
+    const slipId = parsed.slipId || buildSlipId_(parsed);
+    const payload = {
+      status: 'ok',
+      amount: parsed.amount,
+      paidAt: parsed.paidAt,
+      bankAccount: parsed.bankAccount,
+      slipId,
+      slipUrl: file.getUrl(),
+      ocrDebug: vision ? vision.debug : null,
+      rawText,
+      metadata: getMetadata_(e),
+    };
+
+    return jsonResponse_(payload);
   } catch (err) {
-    console.error('AUTO_IMG: invalid JSON', err);
-    return ContentService.createTextOutput('OK');
+    console.error('AutoImg OCR error', err);
+    return jsonResponse_({ status: 'error', message: String(err) });
   }
+}
 
-  const hdr = e.headers || {};
-  const providedSecret =
-    hdr['X-Worker-Secret'] ||
-    hdr['x-worker-secret'] ||
-    body.workerSecret ||
-    body.secret ||
-    '';
-
-  if (!WORKER_SECRET || providedSecret !== WORKER_SECRET) {
-    console.error('AUTO_IMG: forbidden or missing secret');
-    return ContentService.createTextOutput(JSON.stringify({ ok: false, error: 'forbidden' }))
-      .setMimeType(ContentService.MimeType.JSON);
+function buildBlobFromRequest_(e) {
+  const contents = e?.postData?.contents;
+  if (!contents) {
+    throw new Error('Empty request body');
   }
+  const contentType = e?.postData?.type || 'image/jpeg';
+  const filename = sanitizeFilename(String(e?.parameter?.filename || 'slip.jpg'));
+  return Utilities.newBlob(contents, contentType, filename);
+}
 
-  const events = Array.isArray(body.events) ? body.events : [];
-  events.forEach((ev) => {
-    try {
-      if (ev?.type === 'message' && ev.message?.type === 'image') {
-        const messageId = ev.message.id;
-        const senderId = ev?.source?.userId || null;
-        if (messageId) {
-          const blob = fetchLineImage_(messageId);
-          let ocrText = '';
-          let debugInfo = '';
-          let slipByOcr = null;
-          if (blob) {
-            try {
-              const { text, debug } = callVisionOcrText_(blob);
-              ocrText = text || '';
-              debugInfo = debug || '';
-              slipByOcr = ocrText ? isLikelySlipText_(ocrText) : false;
-              if (slipByOcr) {
-                try {
-                  appendSlipRow_(senderId, ocrText);
-                } catch (err) {
-                  debugInfo += ` | Sheet append error: ${err}`;
-                  console.error('AUTO_IMG: sheet append error', err);
-                }
-              }
-            } catch (err) {
-              debugInfo = `Vision error: ${err}`;
-              console.error('AUTO_IMG: vision error', err);
-            }
-          } else {
-            debugInfo = 'No blob fetched';
-          }
+function sanitizeFilename(name) {
+  return name.replace(/[^a-zA-Z0-9_.-]/g, '_');
+}
 
-        }
-      }
-    } catch (err) {
-      console.error('AUTO_IMG: event handler error', err);
+function getProvidedSecret_(e) {
+  const headers = e?.headers || {};
+  return (
+    headers['X-Worker-Secret'] ||
+    headers['x-worker-secret'] ||
+    e?.parameter?.workerSecret ||
+    e?.parameter?.secret ||
+    ''
+  );
+}
+
+function getMetadata_(e) {
+  const params = e?.parameter || {};
+  const keys = ['mode', 'room', 'lineUserId', 'flowId', 'ticketId'];
+  const meta = {};
+  keys.forEach((key) => {
+    if (params[key]) {
+      meta[key] = params[key];
     }
   });
-
-  return ContentService.createTextOutput(JSON.stringify({ ok: true }))
-    .setMimeType(ContentService.MimeType.JSON);
+  return meta;
 }
 
-/** Manual trigger to prompt OAuth consent for Sheets */
-function authorizeSheets() {
-  const dummy = PROPS.getProperty('SHEET_ID') || '';
-  if (!dummy) {
-    throw new Error('Set SHEET_ID in Script properties before running authorizeSheets');
+function jsonResponse_(payload, opts = {}) {
+  const textOut = ContentService.createTextOutput(JSON.stringify(payload));
+  textOut.setMimeType(opts.mimeType || ContentService.MimeType.JSON);
+  return textOut;
+}
+
+function callVisionOcrText_(file) {
+  if (!VISION_SA_KEY) {
+    throw new Error('Missing VISION_SA_KEY');
   }
-  // A simple read to trigger authorization
-  const ss = SpreadsheetApp.openById(dummy);
-  const name = ss.getName();
-  Logger.log('Sheets access OK for: ' + name);
-}
+  const sa = JSON.parse(VISION_SA_KEY);
 
-function pushLineText_(to, text) {
-  if (!CHANNEL_ACCESS_TOKEN || !to) {
-    console.error('AUTO_IMG: missing token or recipient');
-    return;
-  }
-
-  const url = 'https://api.line.me/v2/bot/message/push';
-  const payload = {
-    to,
-    messages: [{ type: 'text', text: String(text || '') }]
-  };
-
-  const options = {
-    method: 'post',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: 'Bearer ' + CHANNEL_ACCESS_TOKEN
-    },
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true
-  };
-
-  const res = UrlFetchApp.fetch(url, options);
-  const code = res.getResponseCode();
-  if (code < 200 || code >= 300) {
-    console.error('AUTO_IMG: push failed', code, res.getContentText());
-  }
-}
-
-/** Download image content from LINE by messageId */
-function fetchLineImage_(messageId) {
-  if (!CHANNEL_ACCESS_TOKEN || !messageId) return null;
-  const url = 'https://api-data.line.me/v2/bot/message/' + encodeURIComponent(messageId) + '/content';
-  const options = {
-    method: 'get',
-    headers: {
-      Authorization: 'Bearer ' + CHANNEL_ACCESS_TOKEN
-    },
-    muteHttpExceptions: true
-  };
-  const res = UrlFetchApp.fetch(url, options);
-  const code = res.getResponseCode();
-  if (code < 200 || code >= 300) {
-    console.error('AUTO_IMG: fetch image failed', code, res.getContentText());
-    return null;
-  }
-  return res.getBlob();
-}
-
-/**
- * Simple slip heuristic:
- * - JPEG/PNG only
- * - size between 30KB and 8MB
- * - aspect ratio tends to be vertical: h/w >= 1.2
- */
-function isLikelySlip_(blob) {
-  try {
-    const type = (blob.getContentType() || '').toLowerCase();
-    if (!/^image\/(jpeg|png)$/.test(type)) return false;
-
-    const bytes = blob.getBytes();
-    if (!bytes || bytes.length < 30 * 1024 || bytes.length > 8 * 1024 * 1024) return false;
-
-    // Use ImagesService to read dimensions (fast and built-in)
-    const img = ImagesService.open(blob);
-    const w = img.getWidth();
-    const h = img.getHeight();
-    if (!w || !h) return false;
-
-    const ratio = h / w;
-    return ratio >= 1.2; // vertical-ish typical for bank slips
-  } catch (err) {
-    console.error('AUTO_IMG: isLikelySlip error', err);
-    return false;
-  }
-}
-
-/** Decide slip from OCR text */
-function isLikelySlipText_(text) {
-  if (!text) return null;
-  const lower = String(text).toLowerCase();
-  const keywords = [
-    'โอน', 'โอนเงิน', 'บาท', 'สำเร็จ', 'ทำรายการ',
-    'promptpay', 'พร้อมเพย์', 'kbank', 'scb', 'krungthai', 'bangkok bank',
-    'transfer', 'transferred', 'transaction', 'successful', 'success',
-    'slip', 'receipt', 'ref', 'reference', 'bank', 'account', 'payment', 'paid'
-  ];
-  const hits = keywords.filter((k) => lower.includes(k)).length;
-  const hasAmount = /\d[\d,\.]{1,}\s*(บาท|thb|฿)/i.test(text) || /\bthb\s*\d[\d,\.]*/i.test(text);
-  const hasRef = /ref[:\s]/i.test(text);
-  return hits >= 2 || (hasAmount && (hits >= 1 || hasRef));
-}
-
-/** Call Google Vision OCR (Document Text Detection) using SA key from props */
-function callVisionOcrText_(blob) {
-  const keyJson = PROPS.getProperty('VISION_SA_KEY');
-  if (!keyJson) throw new Error('Missing VISION_SA_KEY');
-  const sa = JSON.parse(keyJson);
-
+  const blob = file.getBlob();
   const header = { alg: 'RS256', typ: 'JWT' };
   const now = Math.floor(Date.now() / 1000);
   const claim = {
@@ -197,84 +100,64 @@ function callVisionOcrText_(blob) {
     scope: 'https://www.googleapis.com/auth/cloud-vision',
     aud: 'https://oauth2.googleapis.com/token',
     exp: now + 3600,
-    iat: now
+    iat: now,
   };
   const toB64 = (obj) => Utilities.base64EncodeWebSafe(JSON.stringify(obj));
-  const unsigned = toB64(header) + '.' + toB64(claim);
+  const unsigned = `${toB64(header)}.${toB64(claim)}`;
   const signature = Utilities.base64EncodeWebSafe(
     Utilities.computeRsaSha256Signature(unsigned, sa.private_key)
   );
-  const jwt = unsigned + '.' + signature;
+  const jwt = `${unsigned}.${signature}`;
 
   const tokenRes = UrlFetchApp.fetch('https://oauth2.googleapis.com/token', {
     method: 'post',
     payload: {
       grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-      assertion: jwt
+      assertion: jwt,
     },
-    muteHttpExceptions: true
+    muteHttpExceptions: true,
   });
   const token = JSON.parse(tokenRes.getContentText()).access_token;
-  if (!token) throw new Error('No access token from Google');
+  if (!token) {
+    throw new Error('Failed to acquire Vision access token');
+  }
 
-  const imageB64 = Utilities.base64Encode(blob.getBytes());
   const visionBody = {
     requests: [
       {
-        image: { content: imageB64 },
-        features: [{ type: 'DOCUMENT_TEXT_DETECTION', maxResults: 1 }]
-      }
-    ]
+        image: { content: Utilities.base64Encode(blob.getBytes()) },
+        features: [{ type: 'DOCUMENT_TEXT_DETECTION', maxResults: 1 }],
+        imageContext: { languageHints: ['th', 'en'] },
+      },
+    ],
   };
+
   const res = UrlFetchApp.fetch('https://vision.googleapis.com/v1/images:annotate', {
     method: 'post',
     contentType: 'application/json',
     headers: { Authorization: 'Bearer ' + token },
     payload: JSON.stringify(visionBody),
-    muteHttpExceptions: true
+    muteHttpExceptions: true,
   });
-  const bodyText = res.getContentText();
+
   const code = res.getResponseCode();
+  const text = res.getContentText();
   if (code < 200 || code >= 300) {
-    console.error('AUTO_IMG: vision response', code, bodyText);
-    throw new Error('Vision API failed ' + code);
+    throw new Error(`Vision API error ${code}: ${text}`);
   }
-  const out = JSON.parse(bodyText);
-  const textOut = out?.responses?.[0]?.fullTextAnnotation?.text || '';
-  return { text: textOut, debug: `HTTP ${code}` };
+  const body = JSON.parse(text);
+  const extracted = body?.responses?.[0]?.fullTextAnnotation?.text || '';
+  return { text: extracted, debug: `Vision HTTP ${code}` };
 }
 
-/** Append slip data into Google Sheet if configured */
-function appendSlipRow_(lineUserId, ocrText) {
-  if (!SHEET_ID) {
-    throw new Error('Missing SHEET_ID');
-  }
-  const ss = SpreadsheetApp.openById(SHEET_ID);
-  const sh = SHEET_NAME ? ss.getSheetByName(SHEET_NAME) : ss.getSheets()[0];
-  if (!sh) throw new Error('Sheet not found');
-
-  const amount = parseAmountFromText_(ocrText);
-  const ref = parseRefFromText_(ocrText);
-
-  // Skip appending if this slip looks like a duplicate
-  try {
-    if (isDuplicateSlip_(sh, amount, ref, ocrText)) {
-      console.log('AUTO_IMG: duplicate slip detected; skipping append');
-      return;
-    }
-  } catch (err) {
-    console.error('AUTO_IMG: dedupe check failed', err);
-    // Fall through and attempt append to avoid losing data on dedupe errors
-  }
-
-  sh.appendRow([
-    new Date(),
-    lineUserId || '',
-    'slip',
-    amount !== null ? amount : '',
-    ref || '',
-    ocrText
-  ]);
+function parseKPlusSlip_(text) {
+  const parsed = {
+    amount: parseAmountFromText_(text),
+    bankAccount: parseAccountFromText_(text),
+    paidAt: parseDateFromText_(text),
+  };
+  parsed.slipId = buildSlipId_(parsed);
+  return parsed;
 }
 
 function parseAmountFromText_(text) {
@@ -286,63 +169,141 @@ function parseAmountFromText_(text) {
   return Number.isFinite(num) ? num : null;
 }
 
-function parseRefFromText_(text) {
-  if (!text) return null;
-  const m = /[0-9]{10,}/.exec(text.replace(/\s+/g, ''));
-  return m ? m[0] : null;
+function parseAccountFromText_(text) {
+  if (!text) return '';
+  const match = text.match(/(\d{2,3}-\d-[\d-]{4,16}-\d)/);
+  return match ? match[1] : '';
 }
 
-/**
- * Check whether a slip is already present in the sheet.
- * Strategy:
- * - If OCR-extracted `ref` exists, match against sheet `ref` column (strong match)
- * - Otherwise, if `amount` exists, consider it duplicate when there is a row
- *   with the same amount within the last 7 days or with overlapping OCR text
- */
-function isDuplicateSlip_(sh, amount, ref, ocrText) {
-  try {
-    const lastRow = sh.getLastRow();
-    if (lastRow < 2) return false; // no data rows
-
-    const numRows = Math.max(0, lastRow - 1);
-    const data = sh.getRange(2, 1, numRows, 6).getValues();
-    const now = new Date();
-    const SEVEN_DAYS = 7 * 24 * 60 * 60 * 1000;
-
-    const clean = (s) => (s || '').toString().trim();
-    const needleText = clean(ocrText);
-
-    for (let i = 0; i < data.length; i++) {
-      const row = data[i];
-      const rowDate = row[0];
-      const rowAmount = row[3];
-      const rowRef = clean(row[4]);
-      const rowText = clean(row[5]);
-
-      // Strong match: exact reference number
-      if (ref && rowRef && String(ref).trim() === rowRef) {
-        return true;
-      }
-
-      // Amount-based heuristics
-      if (amount !== null && rowAmount !== '' && Number(rowAmount) === Number(amount)) {
-        // If the previous record is within a recent window, treat as duplicate
-        if (rowDate instanceof Date && now - rowDate <= SEVEN_DAYS) {
-          return true;
-        }
-
-        // If OCR text overlaps substantially, treat as duplicate
-        if (needleText && rowText) {
-          // Compare by checking whether a long prefix of the OCR text appears
-          const prefix = needleText.substring(0, 30);
-          if (prefix.length >= 6 && rowText.indexOf(prefix) !== -1) {
-            return true;
-          }
-        }
-      }
-    }
-  } catch (err) {
-    console.error('AUTO_IMG: isDuplicateSlip_ error', err);
+function parseDateFromText_(text) {
+  if (!text) {
+    return new Date().toISOString();
   }
-  return false;
+
+  const isoMatch = text.match(/(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})(?:[T\s](\d{1,2}:\d{2}))?/);
+  if (isoMatch) {
+    const year = parseInt(isoMatch[1], 10);
+    const month = parseInt(isoMatch[2], 10);
+    const day = parseInt(isoMatch[3], 10);
+    const time = isoMatch[4] || '00:00';
+    return formatIsoDate_(year, month, day, time);
+  }
+
+  const thaiRegex =
+    /(\d{1,2})\s*([^\d\s]+)\s*(\d{2,4})\s*(\d{1,2}:\d{2})/i;
+  const thaiMatch = text.match(thaiRegex);
+  if (thaiMatch) {
+    const day = parseInt(thaiMatch[1], 10);
+    const monthToken = normalizeMonthName_(thaiMatch[2]);
+    const mappedMonth = MONTHS_MAP[monthToken] || MONTHS_MAP[monthToken.replace('.', '')];
+    const rawYear = thaiMatch[3];
+    const timeToken = thaiMatch[4] || '00:00';
+    const year = normalizeYear_(rawYear);
+    if (mappedMonth && year) {
+      return formatIsoDate_(year, mappedMonth, day, timeToken);
+    }
+  }
+
+  return new Date().toISOString();
+}
+
+function formatIsoDate_(year, month, day, time) {
+  const [hourRaw = '00', minuteRaw = '00'] = time.replace(/[^\d:]/g, '').split(':');
+  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}T${String(
+    hourRaw
+  ).padStart(2, '0')}:${String(minuteRaw).padStart(2, '0')}:00+07:00`;
+}
+
+function normalizeMonthName_(token) {
+  if (!token) return '';
+  return token.replace(/[^a-zA-Zก-ฮ]+/g, '').toLowerCase();
+}
+
+const MONTHS_MAP = {
+  jan: 1,
+  january: 1,
+  'ม.ค': 1,
+  'ม.ค.': 1,
+  'มกราคม': 1,
+  feb: 2,
+  february: 2,
+  'ก.พ': 2,
+  'ก.พ.': 2,
+  'กุมภาพันธ์': 2,
+  mar: 3,
+  march: 3,
+  'มี.ค': 3,
+  'มี.ค.': 3,
+  'มีนาคม': 3,
+  apr: 4,
+  april: 4,
+  'เม.ย': 4,
+  'เม.ย.': 4,
+  'เมษายน': 4,
+  may: 5,
+  'พ.ค': 5,
+  'พ.ค.': 5,
+  'พฤษภาคม': 5,
+  jun: 6,
+  june: 6,
+  'มิ.ย': 6,
+  'มิ.ย.': 6,
+  'มิถุนายน': 6,
+  jul: 7,
+  july: 7,
+  'ก.ค': 7,
+  'ก.ค.': 7,
+  'กรกฎาคม': 7,
+  aug: 8,
+  august: 8,
+  'ส.ค': 8,
+  'ส.ค.': 8,
+  'สิงหาคม': 8,
+  sep: 9,
+  sept: 9,
+  september: 9,
+  'ก.ย': 9,
+  'ก.ย.': 9,
+  'กันยายน': 9,
+  oct: 10,
+  october: 10,
+  'ต.ค': 10,
+  'ต.ค.': 10,
+  'ตุลาคม': 10,
+  nov: 11,
+  november: 11,
+  'พ.ย': 11,
+  'พ.ย.': 11,
+  'พฤศจิกายน': 11,
+  dec: 12,
+  december: 12,
+  'ธ.ค': 12,
+  'ธ.ค.': 12,
+  'ธันวาคม': 12,
+};
+
+function normalizeYear_(raw) {
+  if (!raw) return null;
+  const num = parseInt(raw.replace(/[^\d]/g, ''), 10);
+  if (!Number.isFinite(num)) {
+    return null;
+  }
+  if (num > 2400) {
+    return num > 2500 ? num - 543 : num;
+  }
+  if (num < 100) {
+    return 2500 + num - 543;
+  }
+  return num;
+}
+
+function buildSlipId_(data) {
+  const d = new Date(data.paidAt || new Date().toISOString());
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  const ss = String(d.getSeconds()).padStart(2, '0');
+  return `SCN-${y}${m}${day}-${hh}${mm}${ss}`;
 }
