@@ -3,6 +3,20 @@ const WORKER_SECRET = PROPS.getProperty('WORKER_SECRET') || '';
 const SLIP_FOLDER_ID = PROPS.getProperty('SLIP_FOLDER_ID') || '';
 const VISION_SA_KEY = PROPS.getProperty('VISION_SA_KEY') || '';
 
+// ====== RECEIVER ACCOUNTS CONFIG ======
+const RECEIVER_ACCOUNTS = {
+  '0911848961':   { code: 'KKK+', bank: 'KBank', label: 'KBank ชั้น 1' },
+  '2143836889':   { code: 'MAK+', bank: 'KBank', label: 'KBank ชั้น 2 (MAK+)' },
+  '5111482754':   { code: 'KGSI', bank: 'BAY',   label: 'Krungsri ชั้น 3' },
+  '050711087200': { code: 'GSB5', bank: 'GSB',   label: 'GSB ชั้น 4–5' },
+  '7602351442':   { code: 'TTB',  bank: 'TTB',   label: 'TTB ชั้น 4' },
+  '1818203205':   { code: 'KBIZ', bank: 'KBIZ',  label: 'KBIZ' },
+};
+const RECEIVER_ACCOUNT_LIST = Object.keys(RECEIVER_ACCOUNTS);
+
+// ===================================================
+// doPost: route JSON actions OR OCR slip processing
+// ===================================================
 function doPost(e) {
   try {
     const providedSecret = getProvidedSecret_(e);
@@ -10,17 +24,58 @@ function doPost(e) {
       throw new Error('Missing or invalid secret');
     }
 
+    const pd = e && e.postData;
+    const contentType = (pd && pd.type) || '';
+    const contents = (pd && pd.contents) || '';
+
+    // JSON mode only if:
+    //  - content-type is JSON AND
+    //  - body is non-empty
+    const isJson =
+      contentType.toLowerCase().indexOf('application/json') !== -1 &&
+      String(contents).trim() !== '';
+
+    // ---------- JSON mode: actions (e.g. ensureSlipFolder) ----------
+    if (isJson) {
+      let body = {};
+      try {
+        body = JSON.parse(contents || '{}');
+      } catch (_err) {
+        body = {};
+      }
+
+      const action = String(body.action || '').trim();
+
+      if (action === 'ensureSlipFolder') {
+        const parentId = String(body.parentFolderId || '').trim();
+        const yearName = String(body.yearFolderName || '').trim();
+        const ymName   = String(body.ymFolderName || '').trim();
+
+        const result = ensureSlipFolder_(parentId, yearName, ymName);
+        return jsonResponse_(result);
+      }
+
+      // Unknown JSON action
+      return jsonResponse_({
+        status: 'error',
+        message: 'Unknown JSON action: ' + action,
+      });
+    }
+
+    // ---------- Slip mode: OCR + parsing ----------
     const { file } = resolveSlipFile_(e);
 
     const vision = callVisionOcrText_(file);
     const rawText = (vision && vision.text) || '';
     const parsed = parseKPlusSlip_(rawText);
     const slipId = parsed.slipId || buildSlipId_(parsed);
+
     const payload = {
       status: 'ok',
       amount: parsed.amount,
       paidAt: parsed.paidAt,
       bankAccount: parsed.bankAccount,
+      bankAccountNumber: parsed.bankAccountNumber || '',
       slipId,
       slipUrl: file.getUrl(),
       ocrDebug: vision ? vision.debug : null,
@@ -35,6 +90,9 @@ function doPost(e) {
   }
 }
 
+// ===================================================
+// Helpers: request parsing / Drive file resolution
+// ===================================================
 function buildBlobFromRequest_(e) {
   const pd = e && e.postData;
   if (!pd) {
@@ -49,13 +107,13 @@ function buildBlobFromRequest_(e) {
   const bytesLen = bytes ? bytes.length : 0;
   const contentsLen = contents ? contents.length : 0;
 
-  // Prefer bytes if available
+  // Prefer bytes (n8n binary mode)
   if (bytes && bytesLen > 0) {
     console.log('auto-img: using postData.bytes', { filename, type, bytesLen });
     return Utilities.newBlob(bytes, type, filename);
   }
 
-  // Fallback to contents (base64 or raw string)
+  // Fallback to contents (may be base64 or raw string)
   if (contents && contentsLen > 0) {
     if (looksLikeBase64_(contents)) {
       try {
@@ -64,19 +122,22 @@ function buildBlobFromRequest_(e) {
           filename,
           type,
           contentsLen,
-          decodedLen: decoded.length
+          decodedLen: decoded.length,
         });
         return Utilities.newBlob(decoded, type, filename);
       } catch (err) {
         console.warn('auto-img: base64 decode failed, using raw contents', err);
       }
     } else {
-      console.log('auto-img: contents appears raw, using directly', { filename, type, contentsLen });
+      console.log('auto-img: contents appears raw, using directly', {
+        filename,
+        type,
+        contentsLen,
+      });
     }
     return Utilities.newBlob(contents, type, filename);
   }
 
-  // Truly empty
   throw new Error(
     'Empty request body: bytesLen=' +
       bytesLen +
@@ -87,39 +148,22 @@ function buildBlobFromRequest_(e) {
   );
 }
 
+/**
+ * Decide which Drive file to use and which folder it should belong to.
+ *
+ * Priority for target folder:
+ *   1) query param slipFolderId (or folderId)
+ *   2) script property SLIP_FOLDER_ID
+ *   3) no folder (root)
+ */
 function resolveSlipFile_(e) {
   const fileId = String(e?.parameter?.fileId || '').trim();
-  const hasFileId = !!fileId;
-  let targetFolder = null;
 
-  if (SLIP_FOLDER_ID) {
-    targetFolder = DriveApp.getFolderById(SLIP_FOLDER_ID);
-  } else if (!hasFileId) {
-    throw new Error('Missing SLIP_FOLDER_ID');
-  }
-
-  if (hasFileId) {
+  // Case 1: n8n already uploaded the file to Drive and passes fileId
+  if (fileId) {
     const existing = DriveApp.getFileById(fileId);
-    if (!existing) {
-      throw new Error('File not found for fileId=' + fileId);
-    }
 
-    if (targetFolder) {
-      let inFolder = false;
-      const parents = existing.getParents();
-      while (parents.hasNext()) {
-        const parent = parents.next();
-        if (parent.getId() === SLIP_FOLDER_ID) {
-          inFolder = true;
-          break;
-        }
-      }
-      if (!inFolder) {
-        targetFolder.addFile(existing);
-        console.log('auto-img: added existing file to target folder', { fileId, folderId: SLIP_FOLDER_ID });
-      }
-    }
-
+    // Just make sure it is viewable with link.
     try {
       existing.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
     } catch (err) {
@@ -130,23 +174,35 @@ function resolveSlipFile_(e) {
       fileId,
       name: existing.getName(),
       size: existing.getSize(),
-      mime: existing.getMimeType()
+      mime: existing.getMimeType(),
     });
+
+    // ⚠️ IMPORTANT:
+    // Do NOT move/add the file to SLIP_FOLDER_ID here.
+    // It will stay in the folder that n8n uploaded it to
+    // (CheckIn_Slip, Penalty_Slip, Others_Slip, etc.).
     return { file: existing, created: false };
   }
 
+  // Case 2: binary sent directly in HTTP body (no fileId)
   const blob = buildBlobFromRequest_(e);
-  const folder = targetFolder || DriveApp.getRootFolder();
+  const folder =
+    SLIP_FOLDER_ID ? DriveApp.getFolderById(SLIP_FOLDER_ID) : DriveApp.getRootFolder();
+
   const createdFile = folder.createFile(blob);
   createdFile.setDescription('Slip uploaded via n8n OCR');
   createdFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
-  console.log('auto-img: saved file', {
+
+  console.log('auto-img: saved file from raw body', {
     name: createdFile.getName(),
     size: createdFile.getSize(),
-    mime: createdFile.getMimeType()
+    mime: createdFile.getMimeType(),
+    parentFolderId: folder.getId(),
   });
+
   return { file: createdFile, created: true };
 }
+
 
 function sanitizeFilename(name) {
   return name.replace(/[^a-zA-Z0-9_.-]/g, '_');
@@ -165,7 +221,7 @@ function getProvidedSecret_(e) {
 
 function getMetadata_(e) {
   const params = e?.parameter || {};
-  const keys = ['mode', 'room', 'lineUserId', 'flowId', 'ticketId'];
+  const keys = ['mode', 'room', 'lineUserId', 'flowId', 'ticketId', 'reason', 'type'];
   const meta = {};
   keys.forEach((key) => {
     if (params[key]) {
@@ -177,7 +233,6 @@ function getMetadata_(e) {
 
 function looksLikeBase64_(value) {
   if (!value) return false;
-  // If there are control characters, assume raw binary already.
   if (/[\x00-\x08\x0E-\x1F]/.test(value)) return false;
   const normalized = value.replace(/[\r\n\s]/g, '');
   if (!normalized || normalized.length % 4 !== 0) return false;
@@ -190,6 +245,9 @@ function jsonResponse_(payload, opts = {}) {
   return textOut;
 }
 
+// ===================================================
+// Vision OCR
+// ===================================================
 function callVisionOcrText_(file) {
   if (!VISION_SA_KEY) {
     throw new Error('Missing VISION_SA_KEY');
@@ -251,6 +309,7 @@ function callVisionOcrText_(file) {
   }
   const body = JSON.parse(text);
   const response = body?.responses?.[0] || {};
+
   let extracted = (response?.fullTextAnnotation?.text || '').trim();
   if (!extracted && Array.isArray(response?.textAnnotations) && response.textAnnotations.length > 0) {
     extracted = (response.textAnnotations[0].description || '').trim();
@@ -260,36 +319,157 @@ function callVisionOcrText_(file) {
     console.warn('Vision returned empty text', {
       annotations: (response?.textAnnotations || []).length,
       hasFullText: !!response?.fullTextAnnotation?.text,
-      error: response?.error
+      error: response?.error,
     });
   }
 
   return { text: extracted, debug: `Vision HTTP ${code}` };
 }
 
+// ===================================================
+// Parsing K+ slip: amount, date, receiver account
+// ===================================================
 function parseKPlusSlip_(text) {
+  const amount = parseAmountFromText_(text);
+  const paidAt = parseDateFromText_(text);
+  const receiver = detectReceiverAccountFromSlip_(text);
+  const bankAccountCode = receiver ? receiver.meta.code : '';
+  const bankAccountNumber = receiver ? receiver.accountNumber : '';
+
   const parsed = {
-    amount: parseAmountFromText_(text),
-    bankAccount: parseAccountFromText_(text),
-    paidAt: parseDateFromText_(text),
+    amount,
+    paidAt,
+    bankAccount: bankAccountCode,
+    bankAccountNumber,
   };
   parsed.slipId = buildSlipId_(parsed);
   return parsed;
 }
 
-function parseAmountFromText_(text) {
-  if (!text) return null;
-  const m = /([0-9][\d,\.]{0,15})\s*(บาท|thb|฿)/i.exec(text);
-  if (!m) return null;
-  const raw = m[1].replace(/,/g, '');
-  const num = parseFloat(raw);
-  return Number.isFinite(num) ? num : null;
+function detectReceiverAccountFromSlip_(text) {
+  const lines = extractAccountLinesFromSlip_(text);
+  if (!lines.length) return null;
+  const candidate = lines.length > 1 ? lines[1] : lines[0];
+  const byMasked = matchReceiverAccountMasked_(candidate.masked || candidate.raw) ||
+    matchReceiverAccountDigits_(candidate.digits);
+  if (byMasked) return byMasked;
+
+  // Fallback: scan all lines for any digit-run that matches our receiver tails
+  const allLines = String(text || '').split(/\r?\n/);
+  for (let i = 0; i < allLines.length; i += 1) {
+    const digits = onlyDigits_(allLines[i]);
+    if (digits && digits.length >= 4) {
+      const m = matchReceiverAccountDigits_(digits);
+      if (m) return m;
+    }
+  }
+  return null;
 }
 
-function parseAccountFromText_(text) {
-  if (!text) return '';
-  const match = text.match(/(\d{2,3}-\d-[\d-]{4,16}-\d)/);
-  return match ? match[1] : '';
+function extractAccountLinesFromSlip_(text) {
+  if (!text) return [];
+  const out = [];
+  const lines = String(text).split(/\r?\n/);
+  for (let i = 0; i < lines.length; i += 1) {
+    const raw = lines[i].trim();
+    if (!raw) continue;
+    if (!/[xX]/.test(raw)) continue;
+    const normalized = raw.replace(/[^0-9xX-]/g, '');
+    const masked = normalized.replace(/-/g, '');
+    const digits = onlyDigits_(normalized);
+    if (normalized.length >= 7 && digits.length >= 4) {
+      out.push({ raw, masked, digits });
+    }
+  }
+  return out;
+}
+
+function matchReceiverAccountMasked_(masked) {
+  if (!masked) return null;
+  const cleaned = String(masked).replace(/[^0-9xX]/g, '').toLowerCase();
+  if (!cleaned || cleaned.indexOf('x') === -1) return null;
+  const pattern = '^' + cleaned.replace(/x/g, '\\d') + '$';
+  const re = new RegExp(pattern);
+  for (let i = 0; i < RECEIVER_ACCOUNT_LIST.length; i += 1) {
+    const accountNumber = RECEIVER_ACCOUNT_LIST[i];
+    if (accountNumber.length !== cleaned.length) continue;
+    if (re.test(accountNumber)) {
+      return { accountNumber, meta: RECEIVER_ACCOUNTS[accountNumber] };
+    }
+  }
+  return null;
+}
+
+function matchReceiverAccountDigits_(digits) {
+  const cleaned = onlyDigits_(digits);
+  if (!cleaned) return null;
+  if (RECEIVER_ACCOUNTS[cleaned]) {
+    return { accountNumber: cleaned, meta: RECEIVER_ACCOUNTS[cleaned] };
+  }
+
+  const suffixes = [6, 4];
+  for (let s = 0; s < suffixes.length; s += 1) {
+    const len = suffixes[s];
+    if (cleaned.length < len) continue;
+    const suffix = cleaned.slice(-len);
+    for (let i = 0; i < RECEIVER_ACCOUNT_LIST.length; i += 1) {
+      const accountNumber = RECEIVER_ACCOUNT_LIST[i];
+      if (accountNumber.slice(-len) === suffix) {
+        return { accountNumber, meta: RECEIVER_ACCOUNTS[accountNumber] };
+      }
+    }
+  }
+  return null;
+}
+
+function onlyDigits_(value) {
+  if (!value) return '';
+  return String(value).replace(/\D+/g, '');
+}
+
+function parseAmountFromText_(text) {
+  if (!text) return null;
+  // 1) Prefer numbers tagged with currency
+  let m = /([0-9][\d,\.]{0,15})\s*(บาท|thb|฿)/i.exec(text);
+  if (m) {
+    const raw = m[1].replace(/,/g, '');
+    const num = parseFloat(raw);
+    if (Number.isFinite(num)) return num;
+  }
+
+  // 2) Numbers near labels like จำนวนเงิน / ยอดโอน / amount / total (same line or next)
+  const lines = String(text)
+    .split(/\r?\n/)
+    .map((ln) => ln.trim())
+    .filter(Boolean);
+  const LABEL = /(จำนวนเงิน|ยอดโอน|ยอดเงิน|amount|total)/i;
+  for (let i = 0; i < lines.length; i += 1) {
+    if (!LABEL.test(lines[i])) continue;
+    const pool = [lines[i]];
+    if (i + 1 < lines.length) pool.push(lines[i + 1]);
+    for (const seg of pool) {
+      const mm = seg.match(/\b([0-9]{1,3}(?:,[0-9]{3})*(?:[.,]\d{1,2})?)\b/);
+      if (mm) {
+        const raw = mm[1].replace(/,/g, '');
+        const num = parseFloat(raw);
+        if (Number.isFinite(num)) return num;
+      }
+    }
+  }
+
+  // 3) Fallback: take the largest money-looking number (with punctuation) in the text
+  const nums = [];
+  const reAll = /\b[0-9][\d,\.]{3,}\b/g;
+  let mm;
+  while ((mm = reAll.exec(text))) {
+    const raw = mm[0].replace(/,/g, '');
+    const num = parseFloat(raw);
+    if (Number.isFinite(num)) nums.push(num);
+  }
+  if (nums.length) {
+    return nums.sort((a, b) => b - a)[0];
+  }
+  return null;
 }
 
 function parseDateFromText_(text) {
@@ -297,7 +477,9 @@ function parseDateFromText_(text) {
     return new Date().toISOString();
   }
 
-  const isoMatch = text.match(/(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})(?:[T\s](\d{1,2}:\d{2}))?/);
+  const isoMatch = text.match(
+    /(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})(?:[T\s](\d{1,2}:\d{2}))?/
+  );
   if (isoMatch) {
     const year = parseInt(isoMatch[1], 10);
     const month = parseInt(isoMatch[2], 10);
@@ -306,13 +488,13 @@ function parseDateFromText_(text) {
     return formatIsoDate_(year, month, day, time);
   }
 
-  const thaiRegex =
-    /(\d{1,2})\s*([^\d\s]+)\s*(\d{2,4})\s*(\d{1,2}:\d{2})/i;
+  const thaiRegex = /(\d{1,2})\s*([^\d\s]+)\s*(\d{2,4})\s*(\d{1,2}:\d{2})/i;
   const thaiMatch = text.match(thaiRegex);
   if (thaiMatch) {
     const day = parseInt(thaiMatch[1], 10);
     const monthToken = normalizeMonthName_(thaiMatch[2]);
-    const mappedMonth = MONTHS_MAP[monthToken] || MONTHS_MAP[monthToken.replace('.', '')];
+    const mappedMonth =
+      MONTHS_MAP[monthToken] || MONTHS_MAP[monthToken.replace('.', '')];
     const rawYear = thaiMatch[3];
     const timeToken = thaiMatch[4] || '00:00';
     const year = normalizeYear_(rawYear);
@@ -326,9 +508,13 @@ function parseDateFromText_(text) {
 
 function formatIsoDate_(year, month, day, time) {
   const [hourRaw = '00', minuteRaw = '00'] = time.replace(/[^\d:]/g, '').split(':');
-  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}T${String(
-    hourRaw
-  ).padStart(2, '0')}:${String(minuteRaw).padStart(2, '0')}:00+07:00`;
+  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(
+    2,
+    '0'
+  )}T${String(hourRaw).padStart(2, '0')}:${String(minuteRaw).padStart(
+    2,
+    '0'
+  )}:00+07:00`;
 }
 
 function normalizeMonthName_(token) {
@@ -423,4 +609,37 @@ function buildSlipId_(data) {
   const mm = String(d.getMinutes()).padStart(2, '0');
   const ss = String(d.getSeconds()).padStart(2, '0');
   return `SCN-${y}${m}${day}-${hh}${mm}${ss}`;
+}
+
+// ===================================================
+// Folder helpers (for ensureSlipFolder)
+// ===================================================
+function getOrCreateSubfolder_(parentFolder, name) {
+  if (!name) throw new Error('Missing folder name');
+  const it = parentFolder.getFoldersByName(name);
+  if (it.hasNext()) {
+    return it.next();
+  }
+  return parentFolder.createFolder(name);
+}
+
+function ensureSlipFolder_(parentId, yearName, ymName) {
+  if (!parentId) throw new Error('Missing parentId');
+  if (!yearName) throw new Error('Missing yearName');
+  if (!ymName) throw new Error('Missing ymName');
+
+  const parent = DriveApp.getFolderById(parentId);
+  const yearFolder = getOrCreateSubfolder_(parent, yearName);
+  const ymFolder = getOrCreateSubfolder_(yearFolder, ymName);
+
+  return {
+    status: 'ok',
+    yearFolderId: yearFolder.getId(),
+    ymFolderId: ymFolder.getId(),
+  };
+}
+
+function testDriveAuth() {
+  const root = DriveApp.getRootFolder();
+  Logger.log(root.getName());
 }
