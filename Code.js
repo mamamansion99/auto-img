@@ -429,14 +429,30 @@ function onlyDigits_(value) {
 
 function parseAmountFromText_(text) {
   if (!text) return null;
+
+  // 0) Currency prefix (OCR often reads baht sign as "B")
+  //    Example: "B100.00K" or "BAHT 100.00"
+  const prefixRe = /(?:^|[^\w])(?:\u0E3F|B)\s*([0-9][\d,\.]{0,15})/ig;
+  const prefixNums = [];
+  let pm;
+  while ((pm = prefixRe.exec(text))) {
+    const raw = pm[1].replace(/,/g, '');
+    const num = parseFloat(raw);
+    if (Number.isFinite(num)) prefixNums.push(num);
+  }
+  if (prefixNums.length) {
+    return prefixNums.sort((a, b) => b - a)[0];
+  }
+
+  let m;
+
   // 1) Prefer numbers tagged with currency
-  let m = /([0-9][\d,\.]{0,15})\s*(บาท|thb|฿)/i.exec(text);
+  m = /([0-9][\d,\.]{0,15})\s*(บาท|thb|฿)/i.exec(text);
   if (m) {
     const raw = m[1].replace(/,/g, '');
     const num = parseFloat(raw);
     if (Number.isFinite(num)) return num;
   }
-
   // 2) Numbers near labels like จำนวนเงิน / ยอดโอน / amount / total (same line or next)
   const lines = String(text)
     .split(/\r?\n/)
