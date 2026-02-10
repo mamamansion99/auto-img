@@ -8,10 +8,9 @@ const RECEIVER_ACCOUNTS = {
   '0911848961':   { code: 'KKK+', bank: 'KBank', label: 'KBank ชั้น 1' },
   '2143836889':   { code: 'MAK+', bank: 'KBank', label: 'KBank ชั้น 2 (MAK+)' },
   '5111482754':   { code: 'KGSI', bank: 'BAY',   label: 'Krungsri ชั้น 3' },
-  '050711087200': { code: 'GSB5', bank: 'GSB',   label: 'GSB ชั้น 4–5' },
+  '050711087200': { code: 'GSB5', bank: 'GSB',   label: 'GSB ชั้น 5' },
   '7602351442':   { code: 'TTB',  bank: 'TTB',   label: 'TTB ชั้น 4' },
-  '1818203205':   { code: 'KBIZ', bank: 'KBIZ',  label: 'KBIZ' },
-  '1720379874':   { code: 'NEXT', bank: 'NEXT',  label: 'NEXT' },
+  '1720379874':   { code: 'NEXT', bank: 'NEXT',  label: 'NEXT ชั้น 6' },
 };
 const RECEIVER_ACCOUNT_LIST = Object.keys(RECEIVER_ACCOUNTS);
 
