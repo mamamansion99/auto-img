@@ -11,6 +11,7 @@ const RECEIVER_ACCOUNTS = {
   '050711087200': { code: 'GSB5', bank: 'GSB',   label: 'GSB ชั้น 4–5' },
   '7602351442':   { code: 'TTB',  bank: 'TTB',   label: 'TTB ชั้น 4' },
   '1818203205':   { code: 'KBIZ', bank: 'KBIZ',  label: 'KBIZ' },
+  '1720379874':   { code: 'NEXT', bank: 'NEXT',  label: 'NEXT' },
 };
 const RECEIVER_ACCOUNT_LIST = Object.keys(RECEIVER_ACCOUNTS);
 
