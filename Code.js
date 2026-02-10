@@ -427,60 +427,80 @@ function onlyDigits_(value) {
   return String(value).replace(/\D+/g, '');
 }
 
+const AMOUNT_LABEL_RE = /(จำนวนเงิน|จำนวน\s*เงิน|จำนวน\b|ยอดโอน|ยอดเงิน|amount|total|เงินออก|เงินเข้า)/i;
+const FEE_LABEL_RE = /(ค่าธรรมเนียม|fee)/i;
+
+function parseMoneyNumber_(raw) {
+  if (!raw) return null;
+  const num = parseFloat(String(raw).replace(/,/g, ''));
+  if (!Number.isFinite(num)) return null;
+  return Math.abs(num);
+}
+
+function extractAmountFromLine_(line) {
+  if (!line) return null;
+
+  // Currency suffix (บาท/THB/฿)
+  let m = line.match(/(-?\d{1,3}(?:,\d{3})*(?:[.,]\d{1,2})?)\s*(บาท|thb|฿)/i);
+  if (m) return parseMoneyNumber_(m[1]);
+
+  // Currency prefix (฿ or B), but only when prefixed by whitespace/bracket/start
+  m = line.match(/(?:^|[\s\(\[\{])(?:฿|B)\s*(-?\d{1,3}(?:,\d{3})*(?:[.,]\d{1,2})?)/i);
+  if (m) return parseMoneyNumber_(m[1]);
+
+  // Generic number (last resort for labeled lines)
+  m = line.match(/-?\d{1,3}(?:,\d{3})*(?:[.,]\d{1,2})?/);
+  if (m) return parseMoneyNumber_(m[0]);
+
+  return null;
+}
+
 function parseAmountFromText_(text) {
   if (!text) return null;
 
-  // 0) Currency prefix (OCR often reads baht sign as "B")
-  //    Example: "B100.00K" or "BAHT 100.00"
-  const prefixRe = /(?:^|[^\w])(?:\u0E3F|B)\s*([0-9][\d,\.]{0,15})/ig;
-  const prefixNums = [];
+  const lines = String(text)
+    .split(/\r?\n/)
+    .map((ln) => ln.trim())
+    .filter(Boolean);
+
+  // 1) Prefer labeled amount lines (จำนวนเงิน/จำนวน/เงินออก/etc.) and next line.
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (FEE_LABEL_RE.test(line)) continue;
+    const next = i + 1 < lines.length ? lines[i + 1] : '';
+    const combined = `${line} ${next}`;
+
+    if (AMOUNT_LABEL_RE.test(line)) {
+      const amt = extractAmountFromLine_(combined);
+      if (amt != null) return amt;
+    }
+
+    // 2) If the line itself carries currency, try it.
+    if (/(บาท|thb|฿)/i.test(line) || /(?:^|[\s\(\[\{])(?:฿|B)\s*\d/i.test(line)) {
+      const amt = extractAmountFromLine_(line);
+      if (amt != null) return amt;
+    }
+  }
+
+  // 3) Fallback: currency prefix across whole text (avoid Thai-word glued cases)
+  const prefixRe = /(?:^|[\s\(\[\{])(?:\u0E3F|B)\s*(-?\d{1,3}(?:,\d{3})*(?:[.,]\d{1,2})?)/ig;
   let pm;
+  const prefixNums = [];
   while ((pm = prefixRe.exec(text))) {
-    const raw = pm[1].replace(/,/g, '');
-    const num = parseFloat(raw);
-    if (Number.isFinite(num)) prefixNums.push(num);
+    const num = parseMoneyNumber_(pm[1]);
+    if (num != null) prefixNums.push(num);
   }
   if (prefixNums.length) {
     return prefixNums.sort((a, b) => b - a)[0];
   }
 
-  let m;
-
-  // 1) Prefer numbers tagged with currency
-  m = /([0-9][\d,\.]{0,15})\s*(บาท|thb|฿)/i.exec(text);
-  if (m) {
-    const raw = m[1].replace(/,/g, '');
-    const num = parseFloat(raw);
-    if (Number.isFinite(num)) return num;
-  }
-  // 2) Numbers near labels like จำนวนเงิน / ยอดโอน / amount / total (same line or next)
-  const lines = String(text)
-    .split(/\r?\n/)
-    .map((ln) => ln.trim())
-    .filter(Boolean);
-  const LABEL = /(จำนวนเงิน|ยอดโอน|ยอดเงิน|amount|total)/i;
-  for (let i = 0; i < lines.length; i += 1) {
-    if (!LABEL.test(lines[i])) continue;
-    const pool = [lines[i]];
-    if (i + 1 < lines.length) pool.push(lines[i + 1]);
-    for (const seg of pool) {
-      const mm = seg.match(/\b([0-9]{1,3}(?:,[0-9]{3})*(?:[.,]\d{1,2})?)\b/);
-      if (mm) {
-        const raw = mm[1].replace(/,/g, '');
-        const num = parseFloat(raw);
-        if (Number.isFinite(num)) return num;
-      }
-    }
-  }
-
-  // 3) Fallback: take the largest money-looking number (with punctuation) in the text
+  // 4) Fallback: take the largest money-looking number (with punctuation) in the text
   const nums = [];
-  const reAll = /\b[0-9][\d,\.]{3,}\b/g;
+  const reAll = /\b-?\d{1,3}(?:,\d{3})*(?:[.,]\d{1,2})?\b/g;
   let mm;
   while ((mm = reAll.exec(text))) {
-    const raw = mm[0].replace(/,/g, '');
-    const num = parseFloat(raw);
-    if (Number.isFinite(num)) nums.push(num);
+    const num = parseMoneyNumber_(mm[0]);
+    if (num != null) nums.push(num);
   }
   if (nums.length) {
     return nums.sort((a, b) => b - a)[0];
@@ -494,7 +514,7 @@ function parseDateFromText_(text) {
   }
 
   const isoMatch = text.match(
-    /(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})(?:[T\s](\d{1,2}:\d{2}))?/
+    /(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})(?:[T\s,]+(\d{1,2}:\d{2}))?/
   );
   if (isoMatch) {
     const year = parseInt(isoMatch[1], 10);
@@ -504,7 +524,21 @@ function parseDateFromText_(text) {
     return formatIsoDate_(year, month, day, time);
   }
 
-  const thaiRegex = /(\d{1,2})\s*([^\d\s]+)\s*(\d{2,4})\s*(\d{1,2}:\d{2})/i;
+  // dd/mm/yy or dd/mm/yyyy
+  const dmyMatch = text.match(
+    /(\d{1,2})[-\/](\d{1,2})[-\/](\d{2,4})(?:[T\s,]+(\d{1,2}:\d{2}))?/i
+  );
+  if (dmyMatch) {
+    const day = parseInt(dmyMatch[1], 10);
+    const month = parseInt(dmyMatch[2], 10);
+    const year = normalizeYear_(dmyMatch[3]);
+    const time = dmyMatch[4] || '00:00';
+    if (year) {
+      return formatIsoDate_(year, month, day, time);
+    }
+  }
+
+  const thaiRegex = /(\d{1,2})\s*([^\d\s]+)\s*(\d{2,4})(?:[,\s\-]+(\d{1,2}:\d{2}))?/i;
   const thaiMatch = text.match(thaiRegex);
   if (thaiMatch) {
     const day = parseInt(thaiMatch[1], 10);
@@ -543,61 +577,73 @@ const MONTHS_MAP = {
   january: 1,
   'ม.ค': 1,
   'ม.ค.': 1,
+  'มค': 1,
   'มกราคม': 1,
   feb: 2,
   february: 2,
   'ก.พ': 2,
   'ก.พ.': 2,
+  'กพ': 2,
   'กุมภาพันธ์': 2,
   mar: 3,
   march: 3,
   'มี.ค': 3,
   'มี.ค.': 3,
+  'มีค': 3,
   'มีนาคม': 3,
   apr: 4,
   april: 4,
   'เม.ย': 4,
   'เม.ย.': 4,
+  'เมย': 4,
   'เมษายน': 4,
   may: 5,
   'พ.ค': 5,
   'พ.ค.': 5,
+  'พค': 5,
   'พฤษภาคม': 5,
   jun: 6,
   june: 6,
   'มิ.ย': 6,
   'มิ.ย.': 6,
+  'มิย': 6,
   'มิถุนายน': 6,
   jul: 7,
   july: 7,
   'ก.ค': 7,
   'ก.ค.': 7,
+  'กค': 7,
   'กรกฎาคม': 7,
   aug: 8,
   august: 8,
   'ส.ค': 8,
   'ส.ค.': 8,
+  'สค': 8,
   'สิงหาคม': 8,
   sep: 9,
   sept: 9,
   september: 9,
   'ก.ย': 9,
   'ก.ย.': 9,
+  'กย': 9,
   'กันยายน': 9,
   oct: 10,
   october: 10,
   'ต.ค': 10,
   'ต.ค.': 10,
+  'ตค': 10,
   'ตุลาคม': 10,
   nov: 11,
   november: 11,
   'พ.ย': 11,
   'พ.ย.': 11,
+  'พย': 11,
   'พฤศจิกายน': 11,
   dec: 12,
   december: 12,
   'ธ.ค': 12,
   'ธ.ค.': 12,
+  'ธค': 12,
   'ธันวาคม': 12,
 };
 
