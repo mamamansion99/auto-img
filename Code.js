@@ -8,19 +8,31 @@ const RECEIVER_ACCOUNTS = {
   '0911848961':   { code: 'KKK+', bank: 'KBank', label: 'KBank ชั้น 1' },
   '2143836889':   { code: 'MAK+', bank: 'KBank', label: 'KBank ชั้น 2 (MAK+)' },
   '5111482754':   { code: 'KGSI', bank: 'BAY',   label: 'Krungsri ชั้น 3' },
-  '050711087200': { code: 'GSB5', bank: 'GSB',   label: 'GSB ชั้น 5' },
+  '8049912129':   { code: 'KGSI_MA', bank: 'BAY', label: 'Krungsri MA' },
+  '050711087200': { code: 'GSB',  bank: 'GSB',   label: 'GSB ชั้น 5' },
   '7602351442':   { code: 'TTB',  bank: 'TTB',   label: 'TTB ชั้น 4' },
   '1720379874':   { code: 'NEXT', bank: 'NEXT',  label: 'NEXT ชั้น 6' },
+  '8032226225':   { code: 'LH_MA', bank: 'LH',   label: 'LH Bank MA' },
+  '3753793931':   { code: 'UOB_MA', bank: 'UOB',  label: 'UOB MA ชั้น 2' },
 };
 const RECEIVER_ACCOUNT_LIST = Object.keys(RECEIVER_ACCOUNTS);
 
 // ===================================================
-// doPost: route JSON actions OR OCR slip processing
+// Web app entrypoints: route JSON actions OR OCR slip processing
 // ===================================================
+function doGet(e) {
+  return handleRequest_(e, 'GET');
+}
+
 function doPost(e) {
+  return handleRequest_(e, 'POST');
+}
+
+function handleRequest_(e, method) {
   try {
     const providedSecret = getProvidedSecret_(e);
-    if (WORKER_SECRET && providedSecret !== WORKER_SECRET) {
+    const isLegacyGetOcr = method === 'GET' && String(e?.parameter?.fileId || '').trim();
+    if (WORKER_SECRET && providedSecret !== WORKER_SECRET && !isLegacyGetOcr) {
       throw new Error('Missing or invalid secret');
     }
 
