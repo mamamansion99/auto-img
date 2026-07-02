@@ -14,6 +14,8 @@ const RECEIVER_ACCOUNTS = {
   '1720379874':   { code: 'NEXT', bank: 'NEXT',  label: 'NEXT ชั้น 6' },
   '8032226225':   { code: 'LH_MA', bank: 'LH',   label: 'LH Bank MA' },
   '3753793931':   { code: 'UOB_MA', bank: 'UOB',  label: 'UOB MA ชั้น 2' },
+  '3753738817':   { code: 'UOB_KK', bank: 'UOB',  label: 'UOB พยงค์ ชั้น 1' },
+  '020486645102': { code: 'GSB_Ma', bank: 'GSB',  label: 'GSB ธิมา ชั้น 6' },
 };
 const RECEIVER_ACCOUNT_LIST = Object.keys(RECEIVER_ACCOUNTS);
 
@@ -360,11 +362,12 @@ function parseKPlusSlip_(text) {
 
 function detectReceiverAccountFromSlip_(text) {
   const lines = extractAccountLinesFromSlip_(text);
-  if (!lines.length) return null;
-  const candidate = lines.length > 1 ? lines[1] : lines[0];
-  const byMasked = matchReceiverAccountMasked_(candidate.masked || candidate.raw) ||
-    matchReceiverAccountDigits_(candidate.digits);
-  if (byMasked) return byMasked;
+  if (lines.length) {
+    const candidate = lines.length > 1 ? lines[1] : lines[0];
+    const byMasked = matchReceiverAccountMasked_(candidate.masked || candidate.raw) ||
+      matchReceiverAccountDigits_(candidate.digits);
+    if (byMasked) return byMasked;
+  }
 
   // Fallback: scan all lines for any digit-run that matches our receiver tails
   const allLines = String(text || '').split(/\r?\n/);
